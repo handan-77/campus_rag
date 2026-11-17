@@ -2,6 +2,11 @@ import os
 import jsonlines
 import chromadb
 from sentence_transformers import SentenceTransformer
+from source_utils import (
+    DEFAULT_MIN_SIMILARITY,
+    preferred_category,
+    select_relevant_sources,
+)
 
 # -------------------------- 全局配置（无需修改） --------------------------
 # 轻量级多语言模型（支持中文，384 维，体积小、云端部署快）
@@ -11,7 +16,7 @@ MODEL_PATH = LOCAL_MODEL_PATH if os.path.isdir(LOCAL_MODEL_PATH) else "sentence-
 INPUT_VECTOR_FILE = "rag_output/chunk_with_vector.jsonl"
 CHROMA_DB_PATH = "./db"
 COLLECTION_NAME = "hunnu_school_knowledge"
-SIM_THRESHOLD = 0.0  # 低于该相似度直接过滤
+SIM_THRESHOLD = DEFAULT_MIN_SIMILARITY
 
 # 加载嵌入模型（本地离线优先，云端自动下载）
 print(f"加载嵌入模型 paraphrase-multilingual-MiniLM-L12-v2（{MODEL_PATH}）...")
@@ -74,33 +79,55 @@ def load_all_chunk_to_chroma():
     print(f"\n✅ 入库操作结束！库内现有总数据量：{final_total} 条")
 
 
-# 检索测试：手动BGE编码，内置相似度过滤，只输出高匹配片段
-def search_test(query: str, top_k: int = 5):
-    print(f"🔍 检索：{query}")
+# 检索入口：一次查询获取候选，再统一完成过滤、去重和排序
+def search_documents(
+    query: str,
+    top_k: int = 5,
+    *,
+    intent: str = "",
+    candidate_k: int | None = None,
+    min_similarity: float = SIM_THRESHOLD,
+):
+    print(f"[retrieval] {query}")
     query_vec = bge_model.encode(query, normalize_embeddings=True).tolist()
+    total = collection.count()
+    if total <= 0:
+        return []
+    candidate_k = candidate_k or max(top_k * 6, 24)
+    n_results = min(max(candidate_k, top_k), total)
     result = collection.query(
         query_embeddings=[query_vec],
-        n_results=top_k,
+        n_results=n_results,
         include=["documents", "metadatas", "distances"]
     )
     docs = result["documents"][0]
     metas = result["metadatas"][0]
     dists = result["distances"][0]
     
-    results = []
+    candidates = []
     for idx in range(len(docs)):
         cos_sim = 1 - dists[idx]
-        if cos_sim < SIM_THRESHOLD:
-            continue
-        results.append({
+        candidates.append({
             "content": docs[idx],
             "title": metas[idx]["title"],
             "score": cos_sim,
             "source_url": metas[idx].get("source_url", "")  # 官网原文链接（溯源跳转用）
         })
-    
-    print(f"   → 找到 {len(results)} 条高匹配结果")
-    return results  # ← 关键：返回结果，而不是打印
+
+    results = select_relevant_sources(
+        candidates,
+        query,
+        top_k=top_k,
+        min_similarity=min_similarity,
+        preferred=preferred_category(intent),
+    )
+    print(f"[retrieval] selected {len(results)} source(s)")
+    return results
+
+
+def search_test(query: str, top_k: int = 5):
+    """Backward-compatible wrapper for scripts and existing callers."""
+    return search_documents(query, top_k=top_k)
 
 if __name__ == "__main__":
     # 前置强制操作：删除旧 rag_vector_db 文件夹

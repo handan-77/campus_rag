@@ -1,15 +1,22 @@
+import os
+
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# 和7.py配置完全对齐
-LOCAL_BGE_PATH = "./models/bge-m3"
+# 与 retriever.py 配置保持一致
+LOCAL_MODEL_PATH = "./models/paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_PATH = (
+    LOCAL_MODEL_PATH
+    if os.path.isdir(LOCAL_MODEL_PATH)
+    else "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 CHROMA_DB_PATH = "./db"
 COLLECTION_NAME = "hunnu_school_knowledge"
-COS_THRESHOLD = 0.6
+COS_THRESHOLD = 0.52
 
-# 加载本地离线嵌入模型
-print("===== 加载本地BGE-M3向量模型 =====")
-bge_model = SentenceTransformer(LOCAL_BGE_PATH)
+# 加载当前检索使用的嵌入模型
+print("===== 加载检索向量模型 =====")
+bge_model = SentenceTransformer(MODEL_PATH)
 # 连接余弦空间向量库
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 coll = client.get_collection(COLLECTION_NAME)
@@ -28,8 +35,8 @@ def base_database_check():
     sample = coll.get(limit=3, include=["documents", "metadatas", "embeddings"])
     vec_dim = len(sample["embeddings"][0])
     print(f"向量标准维度：{vec_dim}")
-    if vec_dim == 1024:
-        print("✅ 向量维度统一为1024，无损坏")
+    if vec_dim == 384:
+        print("✅ 向量维度统一为384，无损坏")
     else:
         print("❌ 向量维度异常")
 
@@ -81,7 +88,7 @@ def multi_scene_retrieval_test():
     # 整体质量汇总
     print("===== 三、知识库整体效果汇总报告 =====")
     print(f"本次测试总召回片段：{total_result_count} 条")
-    print(f"高匹配有效片段(余弦≥0.6)：{high_match_count} 条")
+    print(f"高匹配有效片段(余弦≥{COS_THRESHOLD})：{high_match_count} 条")
     high_rate = high_match_count / total_result_count if total_result_count > 0 else 0
     print(f"整体高匹配召回率：{high_rate:.2%}")
 

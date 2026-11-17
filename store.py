@@ -14,7 +14,15 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 CHAT_DIR = os.path.join(ROOT, "data", "chat_store")
 os.makedirs(CHAT_DIR, exist_ok=True)
 
-DEFAULT_PROFILE = {"nickname": "张同学", "sid": "2023010301", "role": "本科生", "avatar": ""}
+DEFAULT_PROFILE = {
+    "nickname": "同学",
+    "sid": "",
+    "role": "本科生",
+    "avatar": "",
+    "grade": "",
+    "gpa": None,
+    "punishment_count": None,
+}
 # 北京时间（UTC+8），云端服务器时区独立于用户
 _CST = timezone(timedelta(hours=8))
 
@@ -43,7 +51,9 @@ def load(user_id: str = "default") -> dict:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and data.get("sessions"):
-                data.setdefault("profile", dict(DEFAULT_PROFILE))
+                profile = data.setdefault("profile", {})
+                for key, value in DEFAULT_PROFILE.items():
+                    profile.setdefault(key, value)
                 data.setdefault("records", {})
                 data.setdefault("favorites", [])
                 data.setdefault("pinned", [])   # 置顶会话 id 列表

@@ -4,10 +4,10 @@
 - 顶部红色通栏：校徽 + 书法字体校名（无 AI 生成标识）
 - 全屏通栏白色页面，无左右/底部留白
 - 对话页：左侧=知识库总览/检索资料（含官网原文溯源链接）+ 聊天会话列表；
-  右侧=对话区 + AI 深度思考过程折叠模块
+  右侧=对话区 + Agent 处理过程折叠模块
 - 聊天记录持久化（data/chat_store/{user_id}.json），多用户登录预留
-- 业务约束：agent.invoke 与原版逐字一致（RAG + 多轮记忆 + 思考步骤），
-  检索数据来自原有 retriever.search_test()（仅新增 source_url 字段透传）
+- 问答链路：Agent 单次检索 + 引用校验 + 证据不足降级
+- 检索来源与回答共用同一批结构化数据，避免重复检索和编号错位
 """
 import base64
 import os
@@ -27,6 +27,7 @@ import streamlit.components.v1 as components
 from agent_graph import agent
 import services
 import store
+from source_utils import CATEGORIES as SOURCE_CATEGORIES
 
 # ========== 页面配置（校徽仅读取本地文件，禁止AI生成） ==========
 _BADGE_CANDIDATES = ["new_badge_clean.png", "hunnu_logo.png", "logo(1).jpg", "logo.jpg", "hnu_emblem.png"]
@@ -78,7 +79,7 @@ if ss["user_id"] is None:
 if "store" not in ss:
     ss["store"] = store.load(ss["user_id"])
 ss.setdefault("cur_sid", ss["store"]["sessions"][-1]["id"])
-ss.setdefault("deep_think", False)             # 深度思考：扩大检索范围(5→8)
+ss.setdefault("deep_think", False)             # 扩大 Agent 检索范围(5→8)
 ss.setdefault("chat_error", None)
 ss.setdefault("last_ask", None)
 ss.setdefault("last_nts", None)
@@ -324,6 +325,8 @@ st.markdown("""
         color: #C8102E !important; font-weight: 600;}
     .src-link:hover {text-decoration: underline;}
     .src-local {display: inline-block; margin-top: 5px; font-size: 11.5px; color: #9aa1ab;}
+    .cite {color: #C8102E !important; font-weight: 700; padding: 0 1px;}
+    .cite:hover {text-decoration: underline;}
     .src-item details {margin-top: 5px;}
     .src-item summary {font-size: 11.5px; color: #C8102E; cursor: pointer; list-style: none;}
     .src-item summary:hover {text-decoration: underline;}
@@ -468,11 +471,28 @@ def _esc(t):
     return _h.escape(str(t or ""))
 
 
-def _md2html(t):
-    """轻量 Markdown 转换（加粗/列表/换行），用于气泡内容"""
+def _md2html(t, sources=None):
+    """轻量 Markdown 转换，并把有效引用编号链接到来源卡片。"""
     t = _esc(t)
     t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.S)
     t = re.sub(r"(?m)^\s*[-*]\s+", "• ", t)
+    valid_ids = {
+        str(source.get("id"))
+        for source in (sources or [])
+        if source.get("id")
+    }
+    if valid_ids:
+        t = re.sub(
+            r"\[(S\d+)\]",
+            lambda match: (
+                f'<a class="cite" href="#src-{match.group(1).upper()}">'
+                f'[{match.group(1).upper()}]</a>'
+                if match.group(1).upper() in valid_ids
+                else match.group(0)
+            ),
+            t,
+            flags=re.IGNORECASE,
+        )
     t = t.replace("\n", "<br>")
     return t
 
@@ -518,25 +538,7 @@ def _footer():
 
 
 # ========== 资料分类（政策制度/专业介绍/新闻通知/通用知识） ==========
-CATS = ["政策制度", "专业介绍", "新闻通知", "通用知识"]
-
-
-def _category(title, content):
-    s = f"{title or ''}{(content or '')[:150]}"
-    if any(k in s for k in ("专业", "学院", "培养", "课程", "学科", "招生", "大创", "学籍")):
-        return "专业介绍"
-    if any(k in s for k in ("新闻", "通知", "公告", "活动", "讲座", "开放", "安排", "动态")):
-        return "新闻通知"
-    if any(k in s for k in ("规章", "办法", "条例", "规定", "违纪", "处分", "制度", "纪律",
-                            "政策", "手册", "管理")):
-        return "政策制度"
-    return "通用知识"
-
-
-def _pseudo_date(title):
-    """由标题生成稳定展示日期（每条来源含日期行）"""
-    h = sum(ord(c) for c in (title or "x"))
-    return f"{2023 + h % 3}-{1 + h % 12:02d}-{1 + h % 28:02d}"
+CATS = [*SOURCE_CATEGORIES, "业务工具"]
 
 
 def _kb_count():
@@ -548,23 +550,7 @@ def _kb_count():
         return 0
 
 
-def _fetch_hits(query):
-    """调用原有 retriever.search_test（未修改核心），获取真实标题/匹配度/官网原文链接"""
-    try:
-        from retriever import search_test
-        k = 8 if ss.get("deep_think") else 5  # 深度思考 → 扩大检索范围
-        raw = search_test(query, top_k=k)
-        return [{"title": h.get("title", "校园知识库文档"),
-                 "content": h.get("content", ""),
-                 "score": float(h.get("score", 0.0)),
-                 "url": h.get("source_url", ""),
-                 "category": _category(h.get("title", ""), h.get("content", ""))}
-                for h in raw]
-    except Exception:
-        return []
-
-
-# ========== 统一问答入口（agent.invoke 与原版逐字一致） ==========
+# ========== 统一问答入口：Agent 检索与界面来源共用同一批数据 ==========
 def _process(prompt):
     sess = _cur()
     with st.spinner("思考中…"):
@@ -572,23 +558,33 @@ def _process(prompt):
             result = agent.invoke({
                 "question": prompt,
                 "chat_history": sess["messages"],
-                "thinking_steps": []
+                "thinking_steps": [],
+                "retrieval_top_k": 8 if ss.get("deep_think") else 5,
+                "profile": ss["store"].get("profile", {}),
             })
         except Exception as e:
-            ss["chat_error"] = str(e)
+            print(f"[chat] agent invocation failed: {type(e).__name__}: {e}")
+            ss["chat_error"] = "暂时无法连接语言模型服务，请稍后重试。"
             return
     steps = result.get("thinking_steps", [])
     answer = result.get("answer", "抱歉，我没有找到答案。")
+    sources = result.get("sources", [])
     sess["messages"].append({"role": "user", "content": prompt})
-    msg = {"role": "assistant", "content": answer}
+    msg = {
+        "role": "assistant",
+        "content": answer,
+        "sources": sources,
+        "evidence_status": result.get("evidence_status", ""),
+        "citation_status": result.get("citation_status", ""),
+    }
     if steps:
         msg["steps"] = steps
     sess["messages"].append(msg)
     if sess["title"] == "新对话":
         sess["title"] = prompt[:16] + ("…" if len(prompt) > 16 else "")
-    sess["hits"] = _fetch_hits(prompt)   # 左侧面板实时更新（真实检索数据）
+    sess["hits"] = sources
     ss["last_hits"] = sess["hits"]
-    store.save(ss["user_id"], ss["store"])   # 聊天记录永久持久化
+    store.save(ss["user_id"], ss["store"])
 
 
 # ========== 对话区增强脚本（事件委托绑定在父页面 document 上，重渲染不失效） ==========
@@ -730,6 +726,18 @@ def _sess_md(sess):
         lines.append(f"**{who}**")
         lines.append("")
         lines.append(str(m.get("content", "")))
+        sources = m.get("sources", [])
+        if sources:
+            lines.append("")
+            lines.append("参考来源：")
+            for source in sources:
+                source_date = source.get("date") or "日期未提供"
+                source_url = source.get("source_url") or ""
+                suffix = f" {source_url}" if source_url else ""
+                lines.append(
+                    f'- [{source.get("id", "")}] {source.get("title", "")}'
+                    f'（{source_date}）{suffix}'
+                )
         lines.append("")
     return "\n".join(lines)
 
@@ -763,21 +771,30 @@ def page_chat():
         body.append(f'<div class="stat-row">{cells}</div>')
         body.append('<div class="panel-sub">检索来源</div>')
         for h in hits:
-            link = (h.get("url") or "").strip()
+            link = (h.get("source_url") or h.get("url") or "").strip()
+            is_tool = h.get("source_type") == "skill"
+            score = float(h.get("score") or 0.0)
+            score_text = "工具" if is_tool else f"{score * 100:.0f}%"
+            date_text = h.get("date") or "文档未提供"
+            category = h.get("category") or "通用知识"
+            source_id = h.get("id") or ""
+            title = h.get("title") or "校园知识库资料"
+            content_status = h.get("content_status")
+            status_text = "　正文：仅收录入口" if content_status == "metadata_only" else ""
             # 仅 http(s) 为真实官网链接；本地文档不可点击（避免跳转无效地址）
             src_link = (f'<a class="src-link" href="{_esc(link)}" target="_blank" rel="noopener">🔗 官网原文 ↗</a>'
                         if link.startswith(("http://", "https://"))
                         else '<span class="src-local">📄 校内资料</span>')
             body.append(
-                f'<div class="src-item">'
-                f'<div class="src-line1"><span class="tag">【{h["category"]}】</span>'
-                f'<span class="tt">{_esc(h["title"][:44])}</span>'
-                f'<span class="score">{h["score"] * 100:.0f}%</span></div>'
-                f'<div class="meta">来源：{_esc(h["title"])}</div>'
-                f'<div class="meta">日期：{_pseudo_date(h["title"])}</div>'
+                f'<div class="src-item" id="src-{_esc(source_id)}">'
+                f'<div class="src-line1"><span class="tag">【{_esc(category)}】</span>'
+                f'<span class="tt">{_esc(title[:44])}</span>'
+                f'<span class="score">{score_text}</span></div>'
+                f'<div class="meta">来源：{_esc(title)}</div>'
+                f'<div class="meta">日期：{_esc(date_text)}　编号：{_esc(source_id)}{status_text}</div>'
                 f'{src_link}'
                 f'<details><summary>查看片段</summary>'
-                f'<div>{_esc(h["content"][:400])}</div></details>'
+                f'<div>{_esc((h.get("content") or "")[:400])}</div></details>'
                 f'</div>')
         panel_body = "".join(body)
         panel_title = "本次检索资料"
@@ -801,10 +818,11 @@ def page_chat():
             extra = ""
             if m["role"] == "assistant" and m.get("steps"):
                 steps_html = "<br>".join(_esc(s) for s in m["steps"])
-                extra = (f'<details class="think"><summary>🧠 AI 深度思考过程（点击展开/收起）</summary>'
+                extra = (f'<details class="think"><summary>🧠 处理过程（点击展开/收起）</summary>'
                          f'<div>{steps_html}</div></details>')
+            message_sources = m.get("sources", [])
             msgs.append(f'<div class="msg {"user" if m["role"] == "user" else ""}">'
-                        f'<div class="bubble">{extra}{_md2html(m["content"])}</div></div>')
+                        f'<div class="bubble">{extra}{_md2html(m["content"], message_sources)}</div></div>')
     msgs.append('</div>')
 
     if ss.get("chat_error"):
@@ -834,9 +852,9 @@ def page_chat():
         'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
         '<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4z"/></svg>发送</button>'
         '</div>')
-    msgs.append(f'<a class="deep-link {"on" if deep else ""}" title="开启后检索范围由5条扩大到8条" '
+    msgs.append(f'<a class="deep-link {"on" if deep else ""}" title="开启后 Agent 检索范围由5条扩大到8条" '
                 f'href="{url("AI对话", deep=0 if deep else 1)}">'
-                f'{"●" if deep else "○"} 深度思考 ▾</a>')
+                f'{"●" if deep else "○"} 扩大检索 ▾</a>')
 
     # 整页纯 HTML（flex 布局，左右等高、全屏通栏）
     # 左栏：聊天记录（上，含导出按钮） + 检索资料（下，details 默认收起，可自由展开）
@@ -1048,7 +1066,7 @@ def page_profile():
     prof = data["profile"]
 
     # —— 编辑资料（昵称/学号/角色/头像上传，写入持久化存储） ——
-    with st.expander("✏️ 编辑个人资料（昵称 / 学号 / 头像）", expanded=False):
+    with st.expander("✏️ 编辑个人资料（身份 / 学业信息 / 头像）", expanded=False):
         with st.form("profile_form", border=False):
             c1, c2 = st.columns(2)
             nick = c1.text_input("昵称", value=prof.get("nickname", ""), key="pf_nick")
@@ -1057,17 +1075,58 @@ def page_profile():
                                 index=["本科生", "研究生", "教职工"].index(prof.get("role", "本科生"))
                                 if prof.get("role") in ("本科生", "研究生", "教职工") else 0,
                                 key="pf_role")
+            c3, c4, c5 = st.columns(3)
+            grade = c3.text_input(
+                "年级（选填）",
+                value=prof.get("grade", ""),
+                placeholder="如：大二",
+                key="pf_grade",
+            )
+            gpa_raw = c4.text_input(
+                "绩点（选填）",
+                value="" if prof.get("gpa") is None else str(prof.get("gpa")),
+                placeholder="如：3.6",
+                key="pf_gpa",
+            )
+            punishment_raw = c5.text_input(
+                "处分次数（选填）",
+                value="" if prof.get("punishment_count") is None else str(prof.get("punishment_count")),
+                placeholder="如：0",
+                key="pf_punishment",
+            )
             up = st.file_uploader("上传/更换头像（jpg / png）", type=["jpg", "jpeg", "png"],
                                   key="pf_avatar")
             if st.form_submit_button("保存资料", type="primary"):
-                prof["nickname"] = nick.strip() or "张同学"
-                prof["sid"] = sno.strip() or "2023010301"
-                prof["role"] = role
-                if up is not None:
-                    prof["avatar"] = f"data:{up.type};base64," + _b64_from_bytes(up.getvalue())
-                store.save(ss["user_id"], data)
-                st.toast("资料已保存")
-                st.rerun()
+                valid = True
+                gpa_value = None
+                punishment_value = None
+                try:
+                    gpa_value = float(gpa_raw.strip()) if gpa_raw.strip() else None
+                    if gpa_value is not None and not 0 <= gpa_value <= 5:
+                        raise ValueError
+                except ValueError:
+                    st.error("绩点应为 0 至 5 之间的数字。")
+                    valid = False
+                try:
+                    punishment_value = int(punishment_raw.strip()) if punishment_raw.strip() else None
+                    if punishment_value is not None and punishment_value < 0:
+                        raise ValueError
+                except ValueError:
+                    st.error("处分次数应为不小于 0 的整数。")
+                    valid = False
+
+                if valid:
+                    prof["nickname"] = nick.strip() or "同学"
+                    prof["sid"] = sno.strip()
+                    prof["role"] = role
+                    prof["grade"] = grade.strip()
+                    prof["gpa"] = gpa_value
+                    prof["punishment_count"] = punishment_value
+                    if up is not None:
+                        prof["avatar"] = f"data:{up.type};base64," + _b64_from_bytes(up.getvalue())
+                    store.save(ss["user_id"], data)
+                    st.toast("资料已保存")
+                    st.rerun()
 
     records = data.get("records", {})
 
@@ -1101,8 +1160,8 @@ def page_profile():
     <div class="m-card pf-card">
         <img class="av" src="{avatar_src}" alt="头像">
         <div style="flex:1;">
-            <div class="pf-name">{_esc(prof.get("nickname", "张同学"))}</div>
-            <div class="pf-meta">学号 {_esc(prof.get("sid", "2023010301"))}</div>
+            <div class="pf-name">{_esc(prof.get("nickname", "同学"))}</div>
+            <div class="pf-meta">学号 {_esc(prof.get("sid") or "未填写")}</div>
         </div>
         <span class="pf-badge">{_esc(prof.get("role", "本科生"))}</span>
     </div>
